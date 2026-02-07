@@ -1,4 +1,4 @@
-# mcp-postgres
+# multi-postgres-mcp-server
 
 **One MCP server for all your PostgreSQL databases.**
 
@@ -12,7 +12,7 @@
 
 The official `@modelcontextprotocol/server-postgres` supports only **one database per server instance**. If you have 5 projects with 5 databases, you need 5 separate MCP server processes.
 
-**mcp-postgres** solves this:
+**multi-postgres-mcp-server** solves this:
 - **One server** serves all your databases
 - **One config file** with all connections
 - **Hot reload** — add a database to config, it's immediately available (no restart)
@@ -52,23 +52,19 @@ The official `@modelcontextprotocol/server-postgres` supports only **one databas
 | `pg_list_tables` | `database`, `schema?` | List tables with row counts |
 | `pg_describe_table` | `database`, `table`, `schema?` | Column types, PK, FK, defaults |
 
-### Installation
+### Quick Start
+
+#### 1. Install & build
 
 ```bash
 git clone https://github.com/VKirill/multi-postgres-mcp-server.git
-cd mcp-postgres
+cd multi-postgres-mcp-server
 npm install
-npm run build
 ```
 
-Or install globally:
-```bash
-npm install -g mcp-postgres-multi
-```
+#### 2. Create config
 
-### Configuration
-
-Create `~/.mcp-postgres/config.json`:
+Create `~/.mcp-postgres/config.json` (or any path you like):
 
 ```json
 {
@@ -95,15 +91,46 @@ Create `~/.mcp-postgres/config.json`:
 }
 ```
 
-You can also use an object format (keyed by any identifier):
+Object format also supported (keyed by any identifier):
 
 ```json
 {
   "connections": {
-    "project-a": {
-      "label": "production",
-      "host": "db.example.com",
-      ...
+    "my-project": { "label": "production", "host": "...", ... }
+  }
+}
+```
+
+#### 3. Add to your AI tool
+
+**Claude Code** (one command):
+```bash
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js
+```
+
+**Claude Code** (with custom config):
+```bash
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js --config /path/to/config.json
+```
+
+**Claude Code** (with --label for single DB):
+```bash
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js --label production
+```
+
+That's it! Claude Code will automatically pick up the server on next start.
+
+#### Alternative: manual JSON config
+
+Add to `~/.claude.json` → `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/multi-postgres-mcp-server/dist/index.js"]
     }
   }
 }
@@ -119,23 +146,7 @@ node dist/index.js --config /path/to/my-config.json
 MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
 ```
 
-### Usage with Claude Code
-
-Add to `~/.claude.json` → `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/mcp-postgres/dist/index.js"]
-    }
-  }
-}
-```
-
-All databases from config are available. The AI can call `pg_list_databases` to see them and `pg_query` with any `database` label.
+Default config path: `~/.mcp-postgres/config.json`
 
 ### Usage with Cursor (per-project isolation)
 
@@ -147,7 +158,7 @@ Create `.cursor/mcp.json` **in each project folder**:
     "postgres": {
       "command": "node",
       "args": [
-        "/path/to/mcp-postgres/dist/index.js",
+        "/path/to/multi-postgres-mcp-server/dist/index.js",
         "--label",
         "production"
       ]
@@ -158,14 +169,16 @@ Create `.cursor/mcp.json` **in each project folder**:
 
 With `--label production`, the server only exposes the `production` database. The AI doesn't see other databases and can query directly without choosing.
 
-### Usage with npx (no installation)
+### Usage with Windsurf / Cline / other MCP clients
+
+Same pattern — add as a stdio MCP server:
 
 ```json
 {
   "mcpServers": {
     "postgres": {
-      "command": "npx",
-      "args": ["-y", "mcp-postgres-multi"]
+      "command": "node",
+      "args": ["/path/to/multi-postgres-mcp-server/dist/index.js"]
     }
   }
 }
@@ -192,6 +205,11 @@ AI calls: pg_describe_table(database="production", table="users")
     name: character varying(100)
     created_at: timestamp with time zone DEFAULT now()
     ...
+
+User: Show me the latest 5 orders
+
+AI calls: pg_query(database="production", query="SELECT * FROM orders ORDER BY created_at DESC LIMIT 5")
+→ { columns: [...], rows: [...], rowCount: 5 }
 ```
 
 ### Security
@@ -203,6 +221,17 @@ AI calls: pg_describe_table(database="production", table="users")
 - Config file with passwords is excluded from git via `.gitignore`
 - Use `--label` to prevent AI from accessing unrelated databases
 
+### Comparison with official server
+
+| Feature | `@modelcontextprotocol/server-postgres` | `multi-postgres-mcp-server` |
+|---|---|---|
+| Databases per server | 1 | Unlimited |
+| Config format | Connection string in args | JSON file |
+| Hot reload | No (restart required) | Yes |
+| Per-project isolation | N/A | `--label` filter |
+| Query safety | Full access | Read-only only |
+| Processes needed for 5 DBs | 5 | 1 |
+
 ---
 
 ## Русский
@@ -211,7 +240,7 @@ AI calls: pg_describe_table(database="production", table="users")
 
 Официальный `@modelcontextprotocol/server-postgres` поддерживает только **одну БД на сервер**. Если у вас 5 проектов с 5 базами — нужно 5 отдельных процессов MCP-сервера.
 
-**mcp-postgres** решает это:
+**multi-postgres-mcp-server** решает это:
 - **Один сервер** обслуживает все БД
 - **Один конфиг** со всеми подключениями
 - **Hot reload** — добавил БД в конфиг, она сразу доступна (без рестарта)
@@ -251,23 +280,19 @@ AI calls: pg_describe_table(database="production", table="users")
 | `pg_list_tables` | `database`, `schema?` | Таблицы с количеством строк |
 | `pg_describe_table` | `database`, `table`, `schema?` | Колонки, типы, PK, FK, defaults |
 
-### Установка
+### Быстрый старт
+
+#### 1. Установка
 
 ```bash
 git clone https://github.com/VKirill/multi-postgres-mcp-server.git
-cd mcp-postgres
+cd multi-postgres-mcp-server
 npm install
-npm run build
 ```
 
-Или глобально:
-```bash
-npm install -g mcp-postgres-multi
-```
+#### 2. Создайте конфиг
 
-### Конфигурация
-
-Создайте `~/.mcp-postgres/config.json`:
+`~/.mcp-postgres/config.json`:
 
 ```json
 {
@@ -285,28 +310,24 @@ npm install -g mcp-postgres-multi
 }
 ```
 
-Путь к конфигу можно задать:
+#### 3. Добавьте в Claude Code
+
+Одной командой:
 ```bash
-node dist/index.js --config /path/to/config.json
-# или
-MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js
 ```
 
-### Claude Code (глобально, все БД)
-
-В `~/.claude.json` → `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/mcp-postgres/dist/index.js"]
-    }
-  }
-}
+С кастомным конфигом:
+```bash
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js --config /path/to/config.json
 ```
+
+С фильтром на одну БД:
+```bash
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js --label production
+```
+
+Готово! Claude Code подхватит сервер при следующем запуске.
 
 ### Cursor (изоляция по проектам)
 
@@ -318,7 +339,7 @@ MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
     "postgres": {
       "command": "node",
       "args": [
-        "/path/to/mcp-postgres/dist/index.js",
+        "/path/to/multi-postgres-mcp-server/dist/index.js",
         "--label",
         "production"
       ]
@@ -328,6 +349,27 @@ MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
 ```
 
 С `--label production` сервер видит только БД `production`. ИИ не знает про другие базы и может сразу делать запросы без выбора.
+
+### Путь к конфигу
+
+```bash
+node dist/index.js --config /path/to/config.json
+# или
+MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
+```
+
+По умолчанию: `~/.mcp-postgres/config.json`
+
+### Сравнение с официальным сервером
+
+| Возможность | `@modelcontextprotocol/server-postgres` | `multi-postgres-mcp-server` |
+|---|---|---|
+| БД на сервер | 1 | Без ограничений |
+| Формат конфига | Connection string в аргументах | JSON файл |
+| Hot reload | Нет (нужен рестарт) | Да |
+| Изоляция по проектам | Нет | Фильтр `--label` |
+| Безопасность запросов | Полный доступ | Только чтение |
+| Процессов для 5 БД | 5 | 1 |
 
 ### Безопасность
 
@@ -345,7 +387,7 @@ MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
 
 官方 `@modelcontextprotocol/server-postgres` 每个服务器实例只支持**一个数据库**。如果你有5个项目对应5个数据库，就需要5个独立的MCP服务器进程。
 
-**mcp-postgres** 解决了这个问题：
+**multi-postgres-mcp-server** 解决了这个问题：
 - **一个服务器**管理所有数据库
 - **一个配置文件**包含所有连接
 - **热重载** — 在配置中添加数据库，立即可用（无需重启）
@@ -385,23 +427,19 @@ MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
 | `pg_list_tables` | `database`, `schema?` | 列出表及行数估计 |
 | `pg_describe_table` | `database`, `table`, `schema?` | 列类型、主键、外键、默认值 |
 
-### 安装
+### 快速开始
+
+#### 1. 安装
 
 ```bash
 git clone https://github.com/VKirill/multi-postgres-mcp-server.git
-cd mcp-postgres
+cd multi-postgres-mcp-server
 npm install
-npm run build
 ```
 
-或全局安装：
-```bash
-npm install -g mcp-postgres-multi
-```
+#### 2. 创建配置
 
-### 配置
-
-创建 `~/.mcp-postgres/config.json`：
+`~/.mcp-postgres/config.json`：
 
 ```json
 {
@@ -419,28 +457,24 @@ npm install -g mcp-postgres-multi
 }
 ```
 
+#### 3. 添加到 Claude Code
+
+一条命令：
+```bash
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js
+```
+
 自定义配置路径：
 ```bash
-node dist/index.js --config /path/to/config.json
-# 或
-MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js --config /path/to/config.json
 ```
 
-### Claude Code（全局，所有数据库）
-
-在 `~/.claude.json` → `mcpServers` 中添加：
-
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/mcp-postgres/dist/index.js"]
-    }
-  }
-}
+单数据库过滤：
+```bash
+claude mcp add postgres -- node /path/to/multi-postgres-mcp-server/dist/index.js --label production
 ```
+
+完成！Claude Code 将在下次启动时自动加载服务器。
 
 ### Cursor（按项目隔离）
 
@@ -452,7 +486,7 @@ MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
     "postgres": {
       "command": "node",
       "args": [
-        "/path/to/mcp-postgres/dist/index.js",
+        "/path/to/multi-postgres-mcp-server/dist/index.js",
         "--label",
         "production"
       ]
@@ -462,6 +496,27 @@ MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
 ```
 
 使用 `--label production` 后，服务器只暴露 `production` 数据库。AI看不到其他数据库，可以直接查询无需选择。
+
+### 配置路径
+
+```bash
+node dist/index.js --config /path/to/config.json
+# 或
+MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
+```
+
+默认路径：`~/.mcp-postgres/config.json`
+
+### 与官方服务器对比
+
+| 功能 | `@modelcontextprotocol/server-postgres` | `multi-postgres-mcp-server` |
+|---|---|---|
+| 每服务器数据库数 | 1 | 无限制 |
+| 配置格式 | 参数中的连接字符串 | JSON 文件 |
+| 热重载 | 否（需重启） | 是 |
+| 按项目隔离 | 无 | `--label` 过滤器 |
+| 查询安全性 | 完全访问 | 仅只读 |
+| 5个数据库需要的进程数 | 5 | 1 |
 
 ### 安全性
 
