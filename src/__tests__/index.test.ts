@@ -1,5 +1,66 @@
-import { describe, it, expect } from "vitest";
-import { isSingleStatement } from "../index.js";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { isSingleStatement, resolveEnvVars } from "../index.js";
+
+// ─── resolveEnvVars ──────────────────────────────────────────────
+
+describe("resolveEnvVars", () => {
+  const ORIG_ENV = { ...process.env };
+
+  beforeEach(() => {
+    process.env.TEST_HOST = "localhost";
+    process.env.TEST_PORT = "5432";
+    process.env.TEST_PASS = "s3cret";
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIG_ENV };
+  });
+
+  it("replaces ${VAR} in a string", () => {
+    expect(resolveEnvVars("host=${TEST_HOST}")).toBe("host=localhost");
+  });
+
+  it("replaces multiple vars in one string", () => {
+    expect(resolveEnvVars("${TEST_HOST}:${TEST_PORT}")).toBe("localhost:5432");
+  });
+
+  it("returns empty string for unset var without default", () => {
+    expect(resolveEnvVars("${NONEXISTENT_VAR_XYZ}")).toBe("");
+  });
+
+  it("uses default value with ${VAR:-default} syntax", () => {
+    expect(resolveEnvVars("${NONEXISTENT_VAR_XYZ:-fallback}")).toBe("fallback");
+  });
+
+  it("prefers env var over default when var is set", () => {
+    expect(resolveEnvVars("${TEST_HOST:-other}")).toBe("localhost");
+  });
+
+  it("processes strings in objects recursively", () => {
+    const input = { host: "${TEST_HOST}", port: 5432, nested: { pass: "${TEST_PASS}" } };
+    const result = resolveEnvVars(input) as Record<string, unknown>;
+    expect(result.host).toBe("localhost");
+    expect(result.port).toBe(5432);
+    expect((result.nested as Record<string, unknown>).pass).toBe("s3cret");
+  });
+
+  it("processes strings in arrays", () => {
+    const input = ["${TEST_HOST}", "${TEST_PORT}"];
+    expect(resolveEnvVars(input)).toEqual(["localhost", "5432"]);
+  });
+
+  it("passes through non-string primitives unchanged", () => {
+    expect(resolveEnvVars(42)).toBe(42);
+    expect(resolveEnvVars(true)).toBe(true);
+    expect(resolveEnvVars(null)).toBe(null);
+  });
+
+  it("handles string with no vars unchanged", () => {
+    expect(resolveEnvVars("plain text")).toBe("plain text");
+  });
+});
+
+// ─── isSingleStatement ──────────────────────────────────────────
 
 describe("isSingleStatement", () => {
   // ─── Single statements (should return TRUE = safe) ──────────────

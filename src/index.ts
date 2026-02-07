@@ -3,9 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import pg from "pg";
-import { readFile } from "fs/promises";
+import { readFile, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { join, resolve } from "path";
+import { platform } from "os";
 
 // ─── CLI args & env ───────────────────────────────────────────────
 
@@ -137,12 +138,66 @@ async function drainAllPools(): Promise<void> {
   await Promise.all(tasks);
 }
 
+// ─── Environment Variable Substitution ───────────────────────────
+
+/**
+ * Replaces `${VAR}` patterns in string values with process.env values.
+ * Supports `${VAR:-default}` syntax for defaults when env var is unset.
+ */
+export function resolveEnvVars(obj: unknown): unknown {
+  if (typeof obj === "string") {
+    return obj.replace(/\$\{([^}]+)\}/g, (_, expr: string) => {
+      const [name, ...rest] = expr.split(":-");
+      const fallback = rest.join(":-");
+      return process.env[name.trim()] ?? fallback ?? "";
+    });
+  }
+  if (Array.isArray(obj)) return obj.map(resolveEnvVars);
+  if (obj !== null && typeof obj === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      out[k] = resolveEnvVars(v);
+    }
+    return out;
+  }
+  return obj;
+}
+
+// ─── Config Caching ──────────────────────────────────────────────
+
+interface ConfigCache {
+  connections: DbConnection[];
+  mtime: number;
+  loadedAt: number;
+}
+
+const CONFIG_CACHE_TTL = 5_000; // 5 seconds
+let configCache: ConfigCache | null = null;
+
 // ─── Config Loading ──────────────────────────────────────────────
 
 async function loadConfig(): Promise<DbConnection[]> {
   try {
+    // Check cache: reuse if TTL not expired and file unchanged
+    if (configCache) {
+      const elapsed = Date.now() - configCache.loadedAt;
+      if (elapsed < CONFIG_CACHE_TTL) return configCache.connections;
+
+      // TTL expired — check mtime
+      try {
+        const s = await stat(CONFIG_PATH);
+        if (s.mtimeMs === configCache.mtime) {
+          configCache.loadedAt = Date.now(); // refresh TTL
+          return configCache.connections;
+        }
+      } catch {
+        // File deleted or inaccessible — fall through to full reload
+      }
+    }
+
     const raw = await readFile(CONFIG_PATH, "utf-8");
-    const parsed = DbConfigSchema.parse(JSON.parse(raw));
+    const jsonWithEnv = resolveEnvVars(JSON.parse(raw));
+    const parsed = DbConfigSchema.parse(jsonWithEnv);
 
     let connections: DbConnection[];
     if (Array.isArray(parsed.connections)) {
@@ -171,6 +226,14 @@ async function loadConfig(): Promise<DbConnection[]> {
 
     if (LABEL_FILTER) {
       connections = connections.filter((c) => c.label === LABEL_FILTER);
+    }
+
+    // Update cache
+    try {
+      const s = await stat(CONFIG_PATH);
+      configCache = { connections, mtime: s.mtimeMs, loadedAt: Date.now() };
+    } catch {
+      configCache = { connections, mtime: 0, loadedAt: Date.now() };
     }
 
     return connections;
@@ -365,8 +428,15 @@ server.tool(
       .array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
       .optional()
       .describe("Optional query parameters for $1, $2, ... placeholders"),
+    limit: z
+      .coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Max rows to return (truncates results if exceeded)"),
   },
-  async ({ database, query, params }) => {
+  async ({ database, query, params, limit }) => {
     try {
       // SQL injection protection: reject multi-statement queries
       if (!isSingleStatement(query)) {
@@ -413,15 +483,28 @@ server.tool(
       }
 
       const columns = result.fields.map((f) => f.name);
+      const totalRows = result.rows.length;
+      const rows = limit && totalRows > limit
+        ? result.rows.slice(0, limit)
+        : result.rows;
+      const truncated = limit && totalRows > limit;
+
+      const payload: Record<string, unknown> = {
+        columns,
+        rows,
+        rowCount: result.rowCount,
+      };
+      if (truncated) {
+        payload.truncated = true;
+        payload.totalRows = totalRows;
+        payload.limit = limit;
+      }
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              { columns, rows: result.rows, rowCount: result.rowCount },
-              null,
-              2
-            ),
+            text: JSON.stringify(payload, null, 2),
           },
         ],
       };
@@ -627,6 +710,92 @@ server.tool(
   }
 );
 
+// Tool 6: Health check
+server.tool(
+  "pg_health_check",
+  "Test database connectivity and return PostgreSQL version and response latency",
+  {
+    database: z.string().describe("Database label from config"),
+  },
+  async ({ database }) => {
+    try {
+      const start = Date.now();
+      const result = await withPool(database, (client) =>
+        client.query("SELECT version() AS version, now() AS server_time")
+      );
+      const latencyMs = Date.now() - start;
+
+      const row = result.rows[0];
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Database: ${database}`,
+              `Status: connected`,
+              `Latency: ${latencyMs}ms`,
+              `Version: ${row.version}`,
+              `Server time: ${row.server_time}`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (e) {
+      return errorResult(e);
+    }
+  }
+);
+
+// Tool 7: Explain query
+server.tool(
+  "pg_explain",
+  "Run EXPLAIN ANALYZE on a query and return the execution plan. The query is always rolled back to prevent side effects.",
+  {
+    database: z.string().describe("Database label from config"),
+    query: z.string().describe("SQL query to analyze"),
+    params: z
+      .array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+      .optional()
+      .describe("Optional query parameters for $1, $2, ... placeholders"),
+  },
+  async ({ database, query, params }) => {
+    try {
+      if (!isSingleStatement(query)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: Multi-statement queries are not allowed.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const explainQuery = `EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) ${query}`;
+      const result = await withPool(database, async (client) => {
+        await client.query("BEGIN");
+        try {
+          const res = params
+            ? await client.query(explainQuery, params)
+            : await client.query(explainQuery);
+          return res;
+        } finally {
+          // Always rollback — EXPLAIN ANALYZE executes the query
+          await client.query("ROLLBACK").catch(() => {});
+        }
+      });
+
+      const plan = result.rows.map((r) => r["QUERY PLAN"]).join("\n");
+      return {
+        content: [{ type: "text", text: plan }],
+      };
+    } catch (e) {
+      return errorResult(e);
+    }
+  }
+);
+
 // ─── Graceful Shutdown ───────────────────────────────────────────
 
 async function shutdown() {
@@ -638,9 +807,30 @@ async function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
+// ─── Config Permission Check ─────────────────────────────────────
+
+async function checkConfigPermissions(): Promise<void> {
+  if (platform() === "win32") return; // Skip on Windows — no Unix-style permissions
+
+  try {
+    const s = await stat(CONFIG_PATH);
+    const mode = s.mode & 0o777;
+    // Warn if group or others can read (anything beyond owner-only)
+    if (mode & 0o077) {
+      console.error(
+        `Warning: Config file ${CONFIG_PATH} has permissions ${mode.toString(8)}. ` +
+          `Consider restricting with: chmod 600 ${CONFIG_PATH}`
+      );
+    }
+  } catch {
+    // File doesn't exist yet or can't stat — skip
+  }
+}
+
 // ─── Start ───────────────────────────────────────────────────────
 
 async function main() {
+  await checkConfigPermissions();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const mode = LABEL_FILTER ? `label="${LABEL_FILTER}"` : "all databases";
