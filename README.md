@@ -55,7 +55,7 @@ The official `@modelcontextprotocol/server-postgres` supports only **one databas
 ### Installation
 
 ```bash
-git clone https://github.com/VKirill/mcp-postgres.git
+git clone https://github.com/VKirill/multi-postgres-mcp-server.git
 cd mcp-postgres
 npm install
 npm run build
@@ -254,7 +254,7 @@ AI calls: pg_describe_table(database="production", table="users")
 ### Установка
 
 ```bash
-git clone https://github.com/VKirill/mcp-postgres.git
+git clone https://github.com/VKirill/multi-postgres-mcp-server.git
 cd mcp-postgres
 npm install
 npm run build
@@ -388,7 +388,7 @@ MCP_POSTGRES_CONFIG=/path/to/config.json node dist/index.js
 ### 安装
 
 ```bash
-git clone https://github.com/VKirill/mcp-postgres.git
+git clone https://github.com/VKirill/multi-postgres-mcp-server.git
 cd mcp-postgres
 npm install
 npm run build
