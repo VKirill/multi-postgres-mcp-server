@@ -6,9 +6,17 @@
   "bin": {
     "mcp-postgres": "dist/index.js"
   },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE",
+    "config.example.json"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepare": "npm run build"
   },
   "keywords": [
@@ -20,7 +28,9 @@
     "cursor",
     "ai",
     "database",
-    "multi-database"
+    "multi-database",
+    "connection-pool",
+    "ssl"
   ],
   "author": "VKirill",
   "license": "MIT",
@@ -44,6 +54,7 @@
     "@types/node": "^22.15.0",
     "@types/pg": "^8.11.11",
     "tsx": "^4.19.3",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.0"
   }
 }

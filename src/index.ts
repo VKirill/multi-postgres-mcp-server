@@ -3,7 +3,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import pg from "pg";
-import { readFileSync, existsSync } from "fs";
+import { readFile } from "fs/promises";
+import { existsSync } from "fs";
 import { join, resolve } from "path";
 
 // ─── CLI args & env ───────────────────────────────────────────────
@@ -12,7 +13,10 @@ const HOME = process.env.USERPROFILE || process.env.HOME || "";
 
 function getArg(name: string): string | null {
   const idx = process.argv.indexOf(name);
-  return idx !== -1 && process.argv[idx + 1] ? process.argv[idx + 1] : null;
+  if (idx === -1) return null;
+  const next = process.argv[idx + 1];
+  if (!next || next.startsWith("--")) return null;
+  return next;
 }
 
 /** --config <path>  or  MCP_POSTGRES_CONFIG env  or  default */
@@ -25,41 +29,146 @@ const CONFIG_PATH = resolve(
 /** --label <name>  — if set, only this database is visible */
 const LABEL_FILTER = getArg("--label");
 
-// ─── Types ────────────────────────────────────────────────────────
+// ─── Zod Schemas ─────────────────────────────────────────────────
 
-interface DbConnection {
-  label: string;
-  host: string;
-  port: number;
-  user: string;
-  password: string;
-  database: string;
-  enabled?: boolean;
+const SslConfigSchema = z.union([
+  z.literal(true),
+  z.object({
+    rejectUnauthorized: z.boolean().optional(),
+    ca: z.string().optional(),
+    cert: z.string().optional(),
+    key: z.string().optional(),
+  }),
+]);
+
+const DbConnectionSchema = z
+  .object({
+    label: z.string().min(1, "Label is required"),
+    host: z.string().optional(),
+    port: z.coerce.number().int().positive().default(5432),
+    user: z.string().optional(),
+    password: z.string().default(""),
+    database: z.string().optional(),
+    url: z.string().optional(),
+    enabled: z.boolean().default(true),
+    ssl: SslConfigSchema.optional(),
+    readOnly: z.boolean().default(true),
+    poolSize: z.coerce.number().int().min(1).max(100).default(5),
+  })
+  .refine((c) => c.url || (c.host && c.user && c.database), {
+    message: "Provide either 'url' or 'host' + 'user' + 'database'",
+  });
+
+type DbConnection = z.infer<typeof DbConnectionSchema>;
+
+const DbConfigSchema = z.object({
+  connections: z.union([
+    z.array(DbConnectionSchema),
+    z.record(z.string(), DbConnectionSchema),
+  ]),
+});
+
+// ─── Connection Pool Management ──────────────────────────────────
+
+interface PoolEntry {
+  pool: pg.Pool;
+  hash: string;
 }
 
-interface DbConfig {
-  connections: DbConnection[] | Record<string, DbConnection>;
+const pools = new Map<string, PoolEntry>();
+
+function connHash(c: DbConnection): string {
+  return JSON.stringify({
+    h: c.host,
+    p: c.port,
+    u: c.user,
+    pw: c.password,
+    d: c.database,
+    url: c.url,
+    ssl: c.ssl,
+    ps: c.poolSize,
+  });
 }
 
-// ─── Config ───────────────────────────────────────────────────────
+function getOrCreatePool(conn: DbConnection): pg.Pool {
+  const hash = connHash(conn);
+  const existing = pools.get(conn.label);
+  if (existing && existing.hash === hash) return existing.pool;
 
-function loadConfig(): DbConnection[] {
+  // Config changed — close old pool
+  if (existing) {
+    existing.pool.end().catch((e) =>
+      console.error(`Pool close error (${conn.label}):`, e)
+    );
+  }
+
+  const cfg: pg.PoolConfig = {
+    connectionTimeoutMillis: 10_000,
+    statement_timeout: 30_000,
+    idleTimeoutMillis: 60_000,
+    max: conn.poolSize,
+  };
+
+  if (conn.url) {
+    cfg.connectionString = conn.url;
+  } else {
+    cfg.host = conn.host;
+    cfg.port = conn.port;
+    cfg.user = conn.user;
+    cfg.password = conn.password;
+    cfg.database = conn.database;
+  }
+
+  if (conn.ssl) {
+    cfg.ssl = conn.ssl === true ? { rejectUnauthorized: false } : conn.ssl;
+  }
+
+  const pool = new pg.Pool(cfg);
+  pool.on("error", (err) =>
+    console.error(`Pool error (${conn.label}):`, err.message)
+  );
+  pools.set(conn.label, { pool, hash });
+  return pool;
+}
+
+async function drainAllPools(): Promise<void> {
+  const tasks = [...pools.values()].map((e) => e.pool.end().catch(() => {}));
+  pools.clear();
+  await Promise.all(tasks);
+}
+
+// ─── Config Loading ──────────────────────────────────────────────
+
+async function loadConfig(): Promise<DbConnection[]> {
   try {
-    const raw = readFileSync(CONFIG_PATH, "utf-8");
-    const config = JSON.parse(raw) as DbConfig;
+    const raw = await readFile(CONFIG_PATH, "utf-8");
+    const parsed = DbConfigSchema.parse(JSON.parse(raw));
 
-    // Support both array and object formats
     let connections: DbConnection[];
-    if (Array.isArray(config.connections)) {
-      connections = config.connections;
+    if (Array.isArray(parsed.connections)) {
+      connections = parsed.connections;
     } else {
-      connections = Object.values(config.connections || {});
+      connections = Object.values(parsed.connections);
     }
 
-    // Filter enabled only
+    // Detect duplicate labels
+    const seen = new Set<string>();
+    for (const c of connections) {
+      if (seen.has(c.label)) {
+        console.error(
+          `Warning: duplicate label "${c.label}" in config — using first occurrence`
+        );
+      }
+      seen.add(c.label);
+    }
+
+    // Deduplicate (keep first)
+    connections = connections.filter(
+      (c, i, arr) => arr.findIndex((x) => x.label === c.label) === i
+    );
+
     connections = connections.filter((c) => c.enabled !== false);
 
-    // Apply --label filter
     if (LABEL_FILTER) {
       connections = connections.filter((c) => c.label === LABEL_FILTER);
     }
@@ -68,7 +177,14 @@ function loadConfig(): DbConnection[] {
   } catch (e) {
     if (!existsSync(CONFIG_PATH)) {
       console.error(`Config not found: ${CONFIG_PATH}`);
-      console.error("Create it with your database connections. See README for format.");
+      console.error(
+        "Create it with your database connections. See README for format."
+      );
+    } else if (e instanceof z.ZodError) {
+      console.error(`Invalid config (${CONFIG_PATH}):`);
+      for (const issue of e.issues) {
+        console.error(`  ${issue.path.join(".")}: ${issue.message}`);
+      }
     } else {
       console.error(`Failed to read config: ${CONFIG_PATH}`, e);
     }
@@ -76,8 +192,8 @@ function loadConfig(): DbConnection[] {
   }
 }
 
-function getConnection(label: string): DbConnection {
-  const connections = loadConfig();
+async function getConnection(label: string): Promise<DbConnection> {
+  const connections = await loadConfig();
   const conn = connections.find((c) => c.label === label);
   if (!conn) {
     const available = connections.map((c) => c.label).join(", ") || "(none)";
@@ -86,30 +202,112 @@ function getConnection(label: string): DbConnection {
   return conn;
 }
 
-async function withClient<T>(
-  label: string,
-  fn: (client: pg.Client) => Promise<T>
-): Promise<T> {
-  const conn = getConnection(label);
-  const client = new pg.Client({
-    host: conn.host,
-    port: conn.port,
-    user: conn.user,
-    password: conn.password,
-    database: conn.database,
-    connectionTimeoutMillis: 10000,
-    statement_timeout: 30000,
-  });
+// ─── SQL Safety ──────────────────────────────────────────────────
 
+/**
+ * Detects multi-statement SQL to prevent injection via statement stacking.
+ * Strips comments, string literals, and dollar-quoted strings before checking
+ * for semicolons. Returns true only if the SQL is a single statement.
+ */
+export function isSingleStatement(sql: string): boolean {
+  let i = 0;
+  const len = sql.length;
+
+  while (i < len) {
+    const ch = sql[i];
+    const next = i + 1 < len ? sql[i + 1] : "";
+
+    // -- single-line comment → skip to EOL
+    if (ch === "-" && next === "-") {
+      i = sql.indexOf("\n", i);
+      if (i === -1) return true;
+      i++;
+      continue;
+    }
+
+    // /* block comment */ → skip to closing
+    if (ch === "/" && next === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      if (end === -1) return true;
+      i = end + 2;
+      continue;
+    }
+
+    // 'single-quoted string' with '' escape
+    if (ch === "'") {
+      i++;
+      while (i < len) {
+        if (sql[i] === "'") {
+          if (i + 1 < len && sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          break;
+        }
+        i++;
+      }
+      i++;
+      continue;
+    }
+
+    // "double-quoted identifier"
+    if (ch === '"') {
+      i++;
+      while (i < len && sql[i] !== '"') i++;
+      i++;
+      continue;
+    }
+
+    // $tag$...$tag$ dollar-quoted string
+    if (ch === "$") {
+      let j = i + 1;
+      while (j < len && /[a-zA-Z0-9_]/.test(sql[j])) j++;
+      if (j < len && sql[j] === "$") {
+        const tag = sql.substring(i, j + 1);
+        const endIdx = sql.indexOf(tag, j + 1);
+        if (endIdx === -1) return true;
+        i = endIdx + tag.length;
+        continue;
+      }
+    }
+
+    // Semicolon — reject if anything meaningful follows
+    if (ch === ";") {
+      const rest = sql.substring(i + 1).trim();
+      if (rest.length > 0) return false;
+    }
+
+    i++;
+  }
+
+  return true;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+function errorResult(e: unknown) {
+  const msg = e instanceof Error ? e.message : String(e);
+  return {
+    content: [{ type: "text" as const, text: `Error: ${msg}` }],
+    isError: true,
+  };
+}
+
+async function withPool<T>(
+  label: string,
+  fn: (client: pg.PoolClient) => Promise<T>
+): Promise<T> {
+  const conn = await getConnection(label);
+  const pool = getOrCreatePool(conn);
+  const client = await pool.connect();
   try {
-    await client.connect();
     return await fn(client);
   } finally {
-    await client.end().catch(() => {});
+    client.release();
   }
 }
 
-// ─── MCP Server ───────────────────────────────────────────────────
+// ─── MCP Server ──────────────────────────────────────────────────
 
 const server = new McpServer({
   name: "postgres",
@@ -122,7 +320,7 @@ server.tool(
   "List all available PostgreSQL databases",
   {},
   async () => {
-    const connections = loadConfig();
+    const connections = await loadConfig();
     if (connections.length === 0) {
       return {
         content: [
@@ -134,9 +332,17 @@ server.tool(
       };
     }
 
-    const lines = connections.map(
-      (c) => `- ${c.label}: ${c.user}@${c.host}:${c.port}/${c.database}`
-    );
+    const lines = connections.map((c) => {
+      const addr = c.url
+        ? "(connection string)"
+        : `${c.user}@${c.host}:${c.port}/${c.database}`;
+      const flags: string[] = [];
+      if (c.ssl) flags.push("SSL");
+      if (!c.readOnly) flags.push("RW");
+      const suffix = flags.length ? ` [${flags.join(", ")}]` : "";
+      return `- ${c.label}: ${addr}${suffix}`;
+    });
+
     return {
       content: [
         {
@@ -148,20 +354,45 @@ server.tool(
   }
 );
 
-// Tool 2: Execute read-only SQL
+// Tool 2: Execute SQL query
 server.tool(
   "pg_query",
-  "Execute a read-only SQL query against a PostgreSQL database",
+  "Execute a SQL query against a PostgreSQL database. Read-only by default; write queries allowed only if the connection is configured with readOnly: false.",
   {
     database: z.string().describe("Database label from config"),
-    query: z.string().describe("SQL query to execute (read-only)"),
+    query: z.string().describe("SQL query to execute"),
+    params: z
+      .array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+      .optional()
+      .describe("Optional query parameters for $1, $2, ... placeholders"),
   },
-  async ({ database, query }) => {
+  async ({ database, query, params }) => {
     try {
-      const result = await withClient(database, async (client) => {
-        await client.query("BEGIN TRANSACTION READ ONLY");
+      // SQL injection protection: reject multi-statement queries
+      if (!isSingleStatement(query)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: Multi-statement queries are not allowed. Send one statement at a time.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const conn = await getConnection(database);
+
+      const result = await withPool(database, async (client) => {
+        if (conn.readOnly) {
+          await client.query("BEGIN TRANSACTION READ ONLY");
+        } else {
+          await client.query("BEGIN");
+        }
         try {
-          const res = await client.query(query);
+          const res = params
+            ? await client.query(query, params)
+            : await client.query(query);
           await client.query("COMMIT");
           return res;
         } catch (e) {
@@ -175,7 +406,7 @@ server.tool(
           content: [
             {
               type: "text",
-              text: `Query executed. ${result.rowCount ?? 0} row(s). No rows returned.`,
+              text: `Query executed. ${result.rowCount ?? 0} row(s) affected. No rows returned.`,
             },
           ],
         };
@@ -195,8 +426,7 @@ server.tool(
         ],
       };
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+      return errorResult(e);
     }
   }
 );
@@ -214,8 +444,8 @@ server.tool(
   },
   async ({ database, schema }) => {
     try {
-      const result = await withClient(database, async (client) => {
-        return client.query(
+      const result = await withPool(database, (client) =>
+        client.query(
           `SELECT t.tablename AS table_name,
                   COALESCE(s.n_live_tup, 0) AS estimated_rows
            FROM pg_tables t
@@ -224,8 +454,8 @@ server.tool(
            WHERE t.schemaname = $1
            ORDER BY t.tablename`,
           [schema]
-        );
-      });
+        )
+      );
 
       if (result.rows.length === 0) {
         return {
@@ -247,16 +477,15 @@ server.tool(
         ],
       };
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+      return errorResult(e);
     }
   }
 );
 
-// Tool 4: Describe table
+// Tool 4: Describe table (with indexes)
 server.tool(
   "pg_describe_table",
-  "Describe columns, types, and constraints of a PostgreSQL table",
+  "Describe columns, types, constraints, and indexes of a PostgreSQL table",
   {
     database: z.string().describe("Database label from config"),
     table: z.string().describe("Table name"),
@@ -267,7 +496,7 @@ server.tool(
   },
   async ({ database, table, schema }) => {
     try {
-      const result = await withClient(database, async (client) => {
+      const result = await withPool(database, async (client) => {
         const colsQuery = `
           SELECT c.column_name, c.data_type, c.character_maximum_length,
                  c.is_nullable, c.column_default,
@@ -300,11 +529,18 @@ server.tool(
           WHERE tc.constraint_type = 'FOREIGN KEY'
             AND tc.table_schema = $1 AND tc.table_name = $2`;
 
-        const [cols, fks] = await Promise.all([
+        const idxQuery = `
+          SELECT indexname, indexdef
+          FROM pg_indexes
+          WHERE schemaname = $1 AND tablename = $2
+          ORDER BY indexname`;
+
+        const [cols, fks, idxs] = await Promise.all([
           client.query(colsQuery, [schema, table]),
           client.query(fkQuery, [schema, table]),
+          client.query(idxQuery, [schema, table]),
         ]);
-        return { cols, fks };
+        return { cols, fks, idxs };
       });
 
       if (result.cols.rows.length === 0) {
@@ -320,36 +556,89 @@ server.tool(
 
       const fkMap = new Map<string, string>();
       for (const fk of result.fks.rows) {
-        fkMap.set(fk.column_name, `-> ${fk.fk_schema}.${fk.fk_table}(${fk.fk_column})`);
+        fkMap.set(
+          fk.column_name,
+          `-> ${fk.fk_schema}.${fk.fk_table}(${fk.fk_column})`
+        );
       }
 
-      const lines = result.cols.rows.map((col) => {
+      const colLines = result.cols.rows.map((col) => {
         let type = col.data_type;
-        if (col.character_maximum_length) type += `(${col.character_maximum_length})`;
+        if (col.character_maximum_length)
+          type += `(${col.character_maximum_length})`;
         const parts = [`  ${col.column_name}: ${type}`];
         if (col.is_pk === "YES") parts.push("[PK]");
         if (col.is_nullable === "NO") parts.push("NOT NULL");
         if (col.column_default) parts.push(`DEFAULT ${col.column_default}`);
-        if (fkMap.has(col.column_name)) parts.push(`[FK ${fkMap.get(col.column_name)}]`);
+        if (fkMap.has(col.column_name))
+          parts.push(`[FK ${fkMap.get(col.column_name)}]`);
         return parts.join(" ");
       });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Table "${schema}"."${table}" (${result.cols.rows.length} columns):\n${lines.join("\n")}`,
-          },
-        ],
-      };
+      let text = `Table "${schema}"."${table}" (${result.cols.rows.length} columns):\n${colLines.join("\n")}`;
+
+      if (result.idxs.rows.length > 0) {
+        const idxLines = result.idxs.rows.map(
+          (idx) => `  ${idx.indexname}: ${idx.indexdef}`
+        );
+        text += `\n\nIndexes (${result.idxs.rows.length}):\n${idxLines.join("\n")}`;
+      }
+
+      return { content: [{ type: "text", text }] };
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+      return errorResult(e);
     }
   }
 );
 
-// ─── Start ────────────────────────────────────────────────────────
+// Tool 5: List schemas
+server.tool(
+  "pg_list_schemas",
+  "List all schemas in a PostgreSQL database",
+  {
+    database: z.string().describe("Database label from config"),
+  },
+  async ({ database }) => {
+    try {
+      const result = await withPool(database, (client) =>
+        client.query(
+          `SELECT schema_name,
+                  (SELECT count(*) FROM information_schema.tables t
+                   WHERE t.table_schema = s.schema_name) AS table_count
+           FROM information_schema.schemata s
+           ORDER BY schema_name`
+        )
+      );
+
+      const lines = result.rows.map(
+        (r) => `- ${r.schema_name} (${r.table_count} tables)`
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Schemas (${result.rows.length}):\n${lines.join("\n")}`,
+          },
+        ],
+      };
+    } catch (e) {
+      return errorResult(e);
+    }
+  }
+);
+
+// ─── Graceful Shutdown ───────────────────────────────────────────
+
+async function shutdown() {
+  console.error("Shutting down — draining connection pools...");
+  await drainAllPools();
+  process.exit(0);
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+
+// ─── Start ───────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();

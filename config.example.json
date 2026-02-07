@@ -7,7 +7,17 @@
       "user": "readonly_user",
       "password": "your_password",
       "database": "myapp",
-      "enabled": true
+      "enabled": true,
+      "ssl": true,
+      "readOnly": true,
+      "poolSize": 5
+    },
+    {
+      "label": "cloud-rds",
+      "url": "postgresql://user:pass@rds-instance.amazonaws.com:5432/mydb?sslmode=require",
+      "enabled": true,
+      "ssl": true,
+      "readOnly": true
     },
     {
       "label": "staging",
@@ -16,7 +26,8 @@
       "user": "dev",
       "password": "dev_password",
       "database": "myapp_staging",
-      "enabled": true
+      "enabled": true,
+      "readOnly": false
     },
     {
       "label": "local",
