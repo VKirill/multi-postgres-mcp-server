@@ -1,0 +1,49 @@
+{
+  "name": "mcp-postgres-multi",
+  "version": "1.0.0",
+  "description": "Multi-database PostgreSQL MCP server. One server, many databases. Supports per-project isolation via --label filter.",
+  "type": "module",
+  "bin": {
+    "mcp-postgres": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "postgresql",
+    "postgres",
+    "model-context-protocol",
+    "claude",
+    "cursor",
+    "ai",
+    "database",
+    "multi-database"
+  ],
+  "author": "VKirill",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VKirill/mcp-postgres.git"
+  },
+  "homepage": "https://github.com/VKirill/mcp-postgres#readme",
+  "bugs": {
+    "url": "https://github.com/VKirill/mcp-postgres/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "pg": "^8.13.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.11.11",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}

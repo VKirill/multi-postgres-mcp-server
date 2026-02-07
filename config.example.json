@@ -1,0 +1,31 @@
+{
+  "connections": [
+    {
+      "label": "production",
+      "host": "db.example.com",
+      "port": 5432,
+      "user": "readonly_user",
+      "password": "your_password",
+      "database": "myapp",
+      "enabled": true
+    },
+    {
+      "label": "staging",
+      "host": "staging-db.example.com",
+      "port": 5432,
+      "user": "dev",
+      "password": "dev_password",
+      "database": "myapp_staging",
+      "enabled": true
+    },
+    {
+      "label": "local",
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "password": "postgres",
+      "database": "devdb",
+      "enabled": false
+    }
+  ]
+}
